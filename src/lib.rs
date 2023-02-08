@@ -1,17 +1,13 @@
 //! www-authenticate
 //! missing HTTP WWW-Authenticate header parser/printer for hyper
 
-extern crate hyperx;
-extern crate unicase;
-extern crate url;
-
-use hyperx::header::{Formatter, Header, RawLike};
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::fmt;
-use std::mem;
-use std::ops::{Deref, DerefMut};
+use std::{fmt, mem, borrow::Cow, collections::HashMap, ops::{Deref, DerefMut}};
+use headers::{Header, HeaderValue, HeaderName};
+use http::header::WWW_AUTHENTICATE;
 use unicase::UniCase;
+pub(crate) use headers::Error;
+
+type Result<T> = std::result::Result<T, Error>;
 
 /// `WWW-Authenticate` header, defined in
 /// [RFC7235](https://tools.ietf.org/html/rfc7235#section-4.1)
@@ -37,12 +33,10 @@ use unicase::UniCase;
 /// # Examples
 ///
 /// ```
-/// # extern crate hyperx;
-/// # extern crate www_authenticate;
-/// # use hyperx::header::Headers;
-/// # use www_authenticate::{WwwAuthenticate, DigestChallenge, Qop,
-/// # Algorithm};
-/// # fn main(){
+/// # use headers::Header;
+/// # use http::{HeaderMap, header::{HeaderValue, Values, WWW_AUTHENTICATE}};
+/// # use www_authenticate::{WwwAuthenticate, DigestChallenge, Qop, Algorithm};
+/// # fn main() {
 /// let auth = WwwAuthenticate::new(
 ///     DigestChallenge {
 ///         realm: Some("http-auth@example.org".into()),
@@ -55,22 +49,24 @@ use unicase::UniCase;
 ///         stale: None,
 ///         userhash: None,
 /// });
-/// let mut headers = Headers::new();
-/// headers.set(auth);
+/// let mut headers = vec![];
+/// auth.encode(&mut headers);
 /// # }
 /// ```
 ///
 /// ```
-/// # extern crate hyperx;
-/// # extern crate www_authenticate;
-/// # use hyperx::header::Headers;
-/// # use www_authenticate::{WwwAuthenticate, BasicChallenge};
-/// # fn main(){
+/// # use std::iter;
+/// # use headers::Header;
+/// # use http::{HeaderMap, header::{HeaderValue, Values, WWW_AUTHENTICATE}};
+/// # use www_authenticate::{WwwAuthenticate, BasicChallenge, Qop, Algorithm};
+/// # fn main() {
 /// let auth = WwwAuthenticate::new(BasicChallenge{realm: "foo".into()});
-/// let mut headers = Headers::new();
-/// headers.set(auth);
-/// let auth = headers.get::<WwwAuthenticate>().unwrap();
-/// let basics = auth.get::<BasicChallenge>().unwrap();
+/// let mut header_values = vec![];
+/// auth.encode(&mut header_values);
+/// let mut headers = HeaderMap::new();
+/// headers.extend(iter::zip(iter::repeat(WWW_AUTHENTICATE), header_values));
+/// let auth = headers.get_all(WWW_AUTHENTICATE);
+/// let auth: WwwAuthenticate = WwwAuthenticate::decode(&mut auth.iter()).unwrap();
 /// # }
 /// ```
 #[derive(Debug, Clone)]
@@ -166,17 +162,24 @@ impl fmt::Display for WwwAuthenticate {
 }
 
 impl Header for WwwAuthenticate {
-    fn header_name() -> &'static str {
-        "WWW-Authenticate"
+    fn name() -> &'static HeaderName {
+        &WWW_AUTHENTICATE
     }
 
-    fn parse_header<'a, T>(raw: &'a T) -> hyperx::Result<Self>
-    where
-        T: RawLike<'a>,
-    {
+    fn encode<E: Extend<HeaderValue>>(&self, values: &mut E) {
+        let value = HeaderValue::from_str(&format!("{}", self))
+            .expect("Parsed WWW-Authenticate header was improperly parsed");
+        values.extend(::std::iter::once(value));
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self>
+        where
+            Self: Sized,
+            I: Iterator<Item = &'i headers::HeaderValue> {
+
         let mut map = HashMap::new();
-        for data in raw.iter() {
-            let stream = parser::Stream::new(data);
+        for data in values {
+            let stream = parser::Stream::new(data.as_bytes());
             loop {
                 let (scheme, challenge) = match stream.challenge() {
                     Ok(v) => v,
@@ -195,10 +198,6 @@ impl Header for WwwAuthenticate {
             }
         }
         Ok(WwwAuthenticate(map))
-    }
-
-    fn fmt_header(&self, f: &mut Formatter) -> fmt::Result {
-        f.fmt_line(self)
     }
 }
 
@@ -421,13 +420,15 @@ mod basic {
 
     #[cfg(test)]
     mod tests {
+        use std::iter;
+        use headers::HeaderValue;
+
         use super::*;
-        use hyperx::header::Raw;
 
         #[test]
         fn test_parse_basic() {
             let input = "Basic realm=\"secret zone\"";
-            let auth = WwwAuthenticate::parse_header(&Raw::from(input)).unwrap();
+            let auth = WwwAuthenticate::decode(&mut iter::once(&HeaderValue::from_str(input).unwrap())).unwrap();
             let mut basics = auth.get::<BasicChallenge>().unwrap();
             assert_eq!(basics.len(), 1);
             let basic = basics.swap_remove(0);
@@ -440,8 +441,6 @@ mod basic {
                 realm: "secret zone".into(),
             };
             let auth = WwwAuthenticate::new(basic.clone());
-            let data = format!("{}", auth);
-            let auth = WwwAuthenticate::parse_header(&Raw::from(data)).unwrap();
             let basic_tripped = auth.get::<BasicChallenge>().unwrap().swap_remove(0);
             assert_eq!(basic, basic_tripped);
         }
@@ -557,12 +556,12 @@ mod digest {
                             let mut v = vec![];
                             let s = parser::Stream::new(qop.as_bytes());
                             loop {
-                                match try_opt!(s.token().ok()) {
+                                match s.token().ok()? {
                                     "auth" => v.push(Qop::Auth),
                                     "auth-int" => v.push(Qop::AuthInt),
                                     _ => (),
                                 }
-                                try_opt!(s.skip_field_sep().ok());
+                                s.skip_field_sep().ok()?;
                                 if s.is_end() {
                                     break;
                                 }
@@ -673,12 +672,13 @@ mod digest {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use hyperx::header::Raw;
+        use std::iter;
+        use headers::HeaderValue;
 
         #[test]
         fn test_parse_digest() {
             let input = r#"Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#;
-            let auth = WwwAuthenticate::parse_header(&Raw::from(input)).unwrap();
+            let auth = WwwAuthenticate::decode(&mut iter::once(&HeaderValue::from_str(input).unwrap())).unwrap();
             let mut digests = auth.get::<DigestChallenge>().unwrap();
             assert_eq!(digests.len(), 1);
             let digest = digests.swap_remove(0);
@@ -712,7 +712,7 @@ mod digest {
             };
             let auth = WwwAuthenticate::new(digest.clone());
             let data = format!("{}", auth);
-            let auth = WwwAuthenticate::parse_header(&Raw::from(data)).unwrap();
+            let auth = WwwAuthenticate::decode(&mut iter::once(&HeaderValue::try_from(data).unwrap())).unwrap();
             let digest_tripped = auth.get::<DigestChallenge>().unwrap().swap_remove(0);
             assert_eq!(digest, digest_tripped);
         }
@@ -720,8 +720,9 @@ mod digest {
 }
 
 mod parser {
+    use crate::{Error, Result};
+
     use super::raw::{ChallengeFields, RawChallenge};
-    use hyperx::{Error, Result};
     use std::cell::Cell;
     use std::str::from_utf8_unchecked;
 
@@ -785,13 +786,13 @@ mod parser {
                 self.inc(1);
                 Ok(())
             } else {
-                Err(Error::Header)
+                Err(Error::invalid())
             }
         }
         pub fn skip_a_next(&self, c: u8) -> Result<()> {
             self.skip_ws()?;
             if self.is_end() {
-                return Err(Error::Header);
+                return Err(Error::invalid());
             }
             self.skip_a(c)
         }
@@ -813,7 +814,7 @@ mod parser {
         {
             self.take_while(f).and_then(|b| {
                 if b.is_empty() {
-                    Err(Error::Header)
+                    Err(Error::invalid())
                 } else {
                     Ok(b)
                 }
@@ -866,11 +867,11 @@ mod parser {
         pub fn quoted_string(&self) -> Result<String> {
             // See https://tools.ietf.org/html/rfc7230#section-3.2.6
             if self.is_end() {
-                return Err(Error::Header);
+                return Err(Error::invalid());
             }
 
             if self.cur() != b'"' {
-                return Err(Error::Header);
+                return Err(Error::invalid());
             }
             self.inc(1);
             let mut s = Vec::new();
@@ -881,22 +882,22 @@ mod parser {
                         s.push(self.cur());
                         self.inc(1);
                     } else {
-                        return Err(Error::Header);
+                        return Err(Error::invalid());
                     }
                 } else if is_qdtext(self.cur()) {
                     s.push(self.cur());
                     self.inc(1);
                 } else {
-                    return Err(Error::Header);
+                    return Err(Error::invalid());
                 }
             }
             if self.is_end() {
-                return Err(Error::Header);
+                return Err(Error::invalid());
             } else {
                 debug_assert!(self.cur() == b'"');
                 self.inc(1);
             }
-            String::from_utf8(s).map_err(|_| Error::Header)
+            String::from_utf8(s).map_err(|_| Error::invalid())
         }
 
         pub fn token68(&self) -> Result<&str> {
@@ -948,13 +949,13 @@ mod parser {
                         if self.skip_field_sep().is_ok() {
                             if map.insert(k, v).is_some() {
                                 // field key must not be duplicated
-                                return Err(Error::Header);
+                                return Err(Error::invalid());
                             }
                             if self.is_end() {
                                 return Ok(RawChallenge::Fields(map));
                             }
                         } else {
-                            return Err(Error::Header);
+                            return Err(Error::invalid());
                         }
                     }
                 }
@@ -1137,15 +1138,20 @@ mod parser {
 mod tests {
     use super::*;
 
-    use hyperx::header::Raw;
+    use headers::{HeaderValue, HeaderMap};
+    use http::header::WWW_AUTHENTICATE;
 
     #[test]
     fn test_www_authenticate_multiple_headers() {
-        let input1 = br#"Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#.to_vec();
-        let input2 = br#"Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=MD5, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#.to_vec();
-        let input = Raw::from(vec![input1, input2]);
+        let input1 = r#"Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#;
+        let input2 = r#"Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=MD5, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#;
+        let input = vec![
+            (WWW_AUTHENTICATE, HeaderValue::from_static(input1)),
+            (WWW_AUTHENTICATE, HeaderValue::from_static(input2))
+        ];
+        let input = HeaderMap::from_iter(input);
 
-        let auth = WwwAuthenticate::parse_header(&input).unwrap();
+        let auth = WwwAuthenticate::decode(&mut input.values()).unwrap();
         let digests = auth.get::<DigestChallenge>().unwrap();
         assert!(digests.contains(&DigestChallenge {
             realm: Some("http-auth@example.org".into()),
